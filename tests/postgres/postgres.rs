@@ -3,7 +3,7 @@ use sqlx::postgres::{
     PgConnectOptions, PgConnection, PgDatabaseError, PgErrorPosition, PgSeverity,
 };
 use sqlx::postgres::{PgPoolOptions, PgRow, Postgres};
-use sqlx::{Column, Connection, Done, Executor, Row, Statement, TypeInfo};
+use sqlx::{Column, Connection, Executor, Row, Statement, TypeInfo};
 use sqlx_test::{new, setup_if_needed};
 use std::env;
 use std::thread;
@@ -80,6 +80,42 @@ async fn it_can_inspect_errors() -> anyhow::Result<()> {
     assert_eq!(err.code(), "42703");
     assert_eq!(err.position(), Some(PgErrorPosition::Original(8)));
     assert_eq!(err.routine(), Some("errorMissingColumn"));
+    assert_eq!(err.constraint(), None);
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_can_inspect_constraint_errors() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+
+    let res: Result<_, sqlx::Error> =
+        sqlx::query("INSERT INTO products VALUES (1, 'Product 1', 0);")
+            .execute(&mut conn)
+            .await;
+    let err = res.unwrap_err();
+
+    // can also do [as_database_error] or use `match ..`
+    let err = err.into_database_error().unwrap();
+
+    assert_eq!(
+        err.message(),
+        "new row for relation \"products\" violates check constraint \"products_price_check\""
+    );
+    assert_eq!(err.code().as_deref(), Some("23514"));
+
+    // can also do [downcast_ref]
+    let err: Box<PgDatabaseError> = err.downcast();
+
+    assert_eq!(err.severity(), PgSeverity::Error);
+    assert_eq!(
+        err.message(),
+        "new row for relation \"products\" violates check constraint \"products_price_check\""
+    );
+    assert_eq!(err.code(), "23514");
+    assert_eq!(err.position(), None);
+    assert_eq!(err.routine(), Some("ExecConstraints"));
+    assert_eq!(err.constraint(), Some("products_price_check"));
 
     Ok(())
 }
@@ -455,7 +491,7 @@ async fn it_can_drop_multiple_transactions() -> anyhow::Result<()> {
 #[sqlx_macros::test]
 async fn pool_smoke_test() -> anyhow::Result<()> {
     #[cfg(any(feature = "_rt-tokio", feature = "_rt-actix"))]
-    use tokio::{task::spawn, time::delay_for as sleep, time::timeout};
+    use tokio::{task::spawn, time::sleep, time::timeout};
 
     #[cfg(feature = "_rt-async-std")]
     use async_std::{future::timeout, task::sleep, task::spawn};
@@ -760,6 +796,79 @@ async fn test_issue_622() -> anyhow::Result<()> {
     }
 
     futures::future::try_join_all(handles).await?;
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn test_describe_outer_join_nullable() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+
+    // test nullability inference for various joins
+
+    // inner join, nullability should not be overridden
+    // language=PostgreSQL
+    let describe = conn
+        .describe(
+            "select tweet.id
+from (values (null)) vals(val)
+         inner join tweet on false",
+        )
+        .await?;
+
+    assert_eq!(describe.nullable(0), Some(false));
+
+    // language=PostgreSQL
+    let describe = conn
+        .describe(
+            "select tweet.id
+from (values (null)) vals(val)
+         left join tweet on false",
+        )
+        .await?;
+
+    // tweet.id is marked NOT NULL but it's brought in from a left-join here
+    // which should make it nullable
+    assert_eq!(describe.nullable(0), Some(true));
+
+    // make sure we don't mis-infer for the outer half of the join
+    // language=PostgreSQL
+    let describe = conn
+        .describe(
+            "select tweet1.id, tweet2.id
+    from tweet tweet1
+    left join tweet tweet2 on false",
+        )
+        .await?;
+
+    assert_eq!(describe.nullable(0), Some(false));
+    assert_eq!(describe.nullable(1), Some(true));
+
+    // right join, nullability should be inverted
+    // language=PostgreSQL
+    let describe = conn
+        .describe(
+            "select tweet1.id, tweet2.id
+    from tweet tweet1
+    right join tweet tweet2 on false",
+        )
+        .await?;
+
+    assert_eq!(describe.nullable(0), Some(true));
+    assert_eq!(describe.nullable(1), Some(false));
+
+    // full outer join, both tables are nullable
+    // language=PostgreSQL
+    let describe = conn
+        .describe(
+            "select tweet1.id, tweet2.id
+    from tweet tweet1
+    full join tweet tweet2 on false",
+        )
+        .await?;
+
+    assert_eq!(describe.nullable(0), Some(true));
+    assert_eq!(describe.nullable(1), Some(true));
 
     Ok(())
 }

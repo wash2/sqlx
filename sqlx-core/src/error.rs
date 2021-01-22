@@ -57,6 +57,10 @@ pub enum Error {
     #[error("no rows returned by a query that expected to return at least one row")]
     RowNotFound,
 
+    /// Type in query doesn't exist. Likely due to typo or missing user type.
+    #[error("type named {type_name} not found")]
+    TypeNotFound { type_name: String },
+
     /// Column index was out of bounds.
     #[error("column index out of bounds: the len is {len}, but the index is {index}")]
     ColumnIndexOutOfBounds { index: usize, len: usize },
@@ -158,6 +162,15 @@ pub trait DatabaseError: 'static + Send + Sync + StdError {
 
     #[doc(hidden)]
     fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static>;
+
+    /// Returns the name of the constraint that triggered the error, if applicable.
+    /// If the error was caused by a conflict of a unique index, this will be the index name.
+    ///
+    /// ### Note
+    /// Currently only populated by the Postgres driver.
+    fn constraint(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl dyn DatabaseError {

@@ -32,12 +32,12 @@
 ///
 /// | Number of Rows | Method to Call*             | Returns                                             | Notes |
 /// |----------------| ----------------------------|-----------------------------------------------------|-------|
-/// | None†          | `.execute(...).await`       | `sqlx::Result<impl Done>`                           | For `INSERT`/`UPDATE`/`DELETE` without `RETURNING`. See [`crate::Done`]. |
+/// | None†          | `.execute(...).await`       | `sqlx::Result<DB::QueryResult>                          | For `INSERT`/`UPDATE`/`DELETE` without `RETURNING`. |
 /// | Zero or One    | `.fetch_optional(...).await`| `sqlx::Result<Option<{adhoc struct}>>`              | Extra rows are ignored. |
 /// | Exactly One    | `.fetch_one(...).await`     | `sqlx::Result<{adhoc struct}>`                      | Errors if no rows were returned. Extra rows are ignored. Aggregate queries, use this. |
 /// | At Least One   | `.fetch(...)`               | `impl Stream<Item = sqlx::Result<{adhoc struct}>>`  | Call `.try_next().await` to get each row result. |
 ///
-/// \* All methods accept one of `&mut {connection type}`, `&mut Transaction` or `&Pool`.  
+/// \* All methods accept one of `&mut {connection type}`, `&mut Transaction` or `&Pool`.
 /// † Only callable if the query returns no columns; otherwise it's assumed the query *may* return at least one row.
 /// ## Requirements
 /// * The `DATABASE_URL` environment variable must be set at build-time to point to a database
@@ -178,15 +178,12 @@
 /// ##### Force Nullable
 /// Selecting a column `foo as "foo?"` (Postgres / SQLite) or `` foo as `foo?` `` (MySQL) overrides
 /// inferred nullability and forces the column to be treated as nullable; this is provided mainly
-/// for symmetry with `!`, but also because nullability inference currently has some holes and false
-/// negatives that may not be completely fixable without doing our own complex analysis on the given
-/// query.
+/// for symmetry with `!`.
 ///
 /// ```rust,ignore
 /// # async fn main() {
 /// # let mut conn = panic!();
-/// // Postgres:
-/// // Note that this query wouldn't work in SQLite as we still don't know the exact type of `id`
+/// // Postgres/SQLite:
 /// let record = sqlx::query!(r#"select 1 as "id?""#) // MySQL: use "select 1 as `id?`" instead
 ///     .fetch_one(&mut conn)
 ///     .await?;
@@ -197,30 +194,45 @@
 /// # }
 /// ```
 ///
-/// One current such hole is exposed by left-joins involving `NOT NULL` columns in Postgres and
-/// SQLite; as we only know nullability for a given column based on the `NOT NULL` constraint
-/// of its original column in a table, if that column is then brought in via a `LEFT JOIN`
-/// we have no good way to know and so continue assuming it may not be null which may result
-/// in some `UnexpectedNull` errors at runtime.
+/// MySQL should be accurate with regards to nullability as it directly tells us when a column is
+/// expected to never be `NULL`. Any mistakes should be considered a bug in MySQL.
+///
+/// However, inference in SQLite and Postgres is more fragile as it depends primarily on observing
+/// `NOT NULL` constraints on columns. If a `NOT NULL` column is brought in by a `LEFT JOIN` then
+/// that column may be `NULL` if its row does not satisfy the join condition. Similarly, a
+/// `FULL JOIN` or `RIGHT JOIN` may generate rows from the primary table that are all `NULL`.
+///
+/// Unfortunately, the result of mistakes in inference is a `UnexpectedNull` error at runtime.
+///
+/// In Postgres, we patch up this inference by analyzing `EXPLAIN VERBOSE` output (which is not
+/// well documented, is highly dependent on the query plan that Postgres generates, and may differ
+/// between releases) to find columns that are the result of left/right/full outer joins. This
+/// analysis errs on the side of producing false positives (marking columns nullable that are not
+/// in practice) but there are likely edge cases that it does not cover yet.
 ///
 /// Using `?` as an override we can fix this for columns we know to be nullable in practice:
 ///
 /// ```rust,ignore
 /// # async fn main() {
 /// # let mut conn = panic!();
-/// // Ironically this is the exact column we look at to determine nullability in Postgres
+/// // Ironically this is the exact column we primarily look at to determine nullability in Postgres
 /// let record = sqlx::query!(
 ///     r#"select attnotnull as "attnotnull?" from (values (1)) ids left join pg_attribute on false"#
 /// )
 /// .fetch_one(&mut conn)
 /// .await?;
 ///
-/// // For Postgres this would have been inferred to be `bool` and we would have gotten an error
+/// // Although we do our best, under Postgres this might have been inferred to be `bool`
+/// // In that case, we would have gotten an error
 /// assert_eq!(record.attnotnull, None);
 /// # }
 /// ```
 ///
-/// See [launchbadge/sqlx#367](https://github.com/launchbadge/sqlx/issues/367) for more details on this issue.
+/// If you find that you need to use this override, please open an issue with a query we can use
+/// to reproduce the problem. For Postgres users, especially helpful would be the output of
+/// `EXPLAIN (VERBOSE, FORMAT JSON) <your query>` with bind parameters substituted in the query
+/// (as the exact value of bind parameters can change the query plan)
+/// and the definitions of any relevant tables (or sufficiently anonymized equivalents).
 ///
 /// ##### Force a Different/Custom Type
 /// Selecting a column `foo as "foo: T"` (Postgres / SQLite) or `` foo as `foo: T` `` (MySQL)
@@ -613,6 +625,77 @@ macro_rules! query_file_as_unchecked (
     ($out_struct:path, $path:literal, $($args:tt)*) => ( {
         $crate::sqlx_macros::expand_query!(record = $out_struct, source_file = $path, args = [$($args)*], checked = false)
     })
+);
+
+/// A variant of [query!] which expects a single column from the query and evaluates to an
+/// instance of [QueryScalar][crate::query::QueryScalar].
+///
+/// The name of the column is not required to be a valid Rust identifier, however you can still
+/// use the column type override syntax in which case the column name _does_ have to be a valid
+/// Rust identifier for the override to parse properly. If the override parse fails the error
+/// is silently ignored (we just don't have a reliable way to tell the difference). **If you're
+/// getting a different type than expected, please check to see if your override syntax is correct
+/// before opening an issue.**
+///
+/// Wildcard overrides like in [query_as!] are also allowed, in which case the output type
+/// is left up to inference.
+///
+/// See [query!] for more information.
+#[macro_export]
+#[cfg_attr(docsrs, doc(cfg(feature = "macros")))]
+macro_rules! query_scalar (
+    ($query:expr) => (
+        $crate::sqlx_macros::expand_query!(scalar = _, source = $query)
+    );
+    ($query:expr, $($args:tt)*) => (
+        $crate::sqlx_macros::expand_query!(scalar = _, source = $query, args = [$($args)*])
+    )
+);
+
+/// A variant of [query_scalar!] which takes a file path like [query_file!].
+#[macro_export]
+#[cfg_attr(docsrs, doc(cfg(feature = "macros")))]
+macro_rules! query_file_scalar (
+    ($path:literal) => (
+        $crate::sqlx_macros::expand_query!(scalar = _, source_file = $path)
+    );
+    ($path:literal, $($args:tt)*) => (
+        $crate::sqlx_macros::expand_query!(scalar = _, source_file = $path, args = [$($args)*])
+    )
+);
+
+/// A variant of [query_scalar!] which does not typecheck bind parameters and leaves the output type
+/// to inference. The query itself is still checked that it is syntactically and semantically
+/// valid for the database, that it only produces one column and that the number of bind parameters
+/// is correct.
+///
+/// For this macro variant the name of the column is irrelevant.
+#[macro_export]
+#[cfg_attr(docsrs, doc(cfg(feature = "macros")))]
+macro_rules! query_scalar_unchecked (
+    ($query:expr) => (
+        $crate::sqlx_macros::expand_query!(scalar = _, source = $query, checked = false)
+    );
+    ($query:expr, $($args:tt)*) => (
+        $crate::sqlx_macros::expand_query!(scalar = _, source = $query, args = [$($args)*], checked = false)
+    )
+);
+
+/// A variant of [query_file_scalar!] which does not typecheck bind parameters and leaves the output
+/// type to inference. The query itself is still checked that it is syntactically and
+/// semantically valid for the database, that it only produces one column and that the number of
+/// bind parameters is correct.
+///
+/// For this macro variant the name of the column is irrelevant.
+#[macro_export]
+#[cfg_attr(docsrs, doc(cfg(feature = "macros")))]
+macro_rules! query_file_scalar_unchecked (
+    ($path:literal) => (
+        $crate::sqlx_macros::expand_query!(scalar = _, source_file = $path, checked = false)
+    );
+    ($path:literal, $($args:tt)*) => (
+        $crate::sqlx_macros::expand_query!(scalar = _, source_file = $path, args = [$($args)*], checked = false)
+    )
 );
 
 /// Embeds migrations into the binary by expanding to a static instance of [Migrator][crate::migrate::Migrator].

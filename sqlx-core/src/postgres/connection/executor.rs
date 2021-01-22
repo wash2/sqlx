@@ -9,8 +9,8 @@ use crate::postgres::message::{
 use crate::postgres::statement::PgStatementMetadata;
 use crate::postgres::type_info::PgType;
 use crate::postgres::{
-    statement::PgStatement, PgArguments, PgConnection, PgDone, PgRow, PgTypeInfo, PgValueFormat,
-    Postgres,
+    statement::PgStatement, PgArguments, PgConnection, PgQueryResult, PgRow, PgTypeInfo,
+    PgValueFormat, Postgres,
 };
 use either::Either;
 use futures_core::future::BoxFuture;
@@ -198,7 +198,7 @@ impl PgConnection {
         limit: u8,
         persistent: bool,
         metadata_opt: Option<Arc<PgStatementMetadata>>,
-    ) -> Result<impl Stream<Item = Result<Either<PgDone, PgRow>, Error>> + 'e, Error> {
+    ) -> Result<impl Stream<Item = Result<Either<PgQueryResult, PgRow>, Error>> + 'e, Error> {
         let mut logger = QueryLogger::new(query, self.log_settings.clone());
 
         // before we continue, wait until we are "ready" to accept more queries
@@ -274,7 +274,7 @@ impl PgConnection {
                         // a SQL command completed normally
                         let cc: CommandComplete = message.decode()?;
 
-                        r#yield!(Either::Left(PgDone {
+                        r#yield!(Either::Left(PgQueryResult {
                             rows_affected: cc.rows_affected(),
                         }));
                     }
@@ -336,7 +336,7 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
     fn fetch_many<'e, 'q: 'e, E: 'q>(
         self,
         mut query: E,
-    ) -> BoxStream<'e, Result<Either<PgDone, PgRow>, Error>>
+    ) -> BoxStream<'e, Result<Either<PgQueryResult, PgRow>, Error>>
     where
         'c: 'e,
         E: Execute<'q, Self::Database>,
@@ -415,9 +415,9 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
         Box::pin(async move {
             self.wait_until_ready().await?;
 
-            let (_, metadata) = self.get_or_prepare(sql, &[], true, None).await?;
+            let (stmt_id, metadata) = self.get_or_prepare(sql, &[], true, None).await?;
 
-            let nullable = self.get_nullable_for_columns(&metadata.columns).await?;
+            let nullable = self.get_nullable_for_columns(stmt_id, &metadata).await?;
 
             Ok(Describe {
                 columns: metadata.columns.clone(),
